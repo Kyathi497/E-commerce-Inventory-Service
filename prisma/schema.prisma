@@ -1,0 +1,169 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+enum StockKind {
+  product
+  packaging
+}
+
+enum StockUnit {
+  g
+  ml
+  pcs
+}
+
+enum StockStatus {
+  active
+  archived
+}
+
+enum ReservationStatus {
+  held
+  committed
+  released
+  expired
+}
+
+enum MovementReason {
+  receive
+  adjust
+  damage
+  return
+  reserve
+  commit
+  release
+  expire
+}
+
+// Tej grinds and packs after the order, so stock is bulk raw material per
+// product in grams (§6.4): a 1 kg jar, a ½ kg jar and a hamper's 180 g jar
+// all draw from the same turmeric. Packaging can be tracked as pcs.
+// A CHECK constraint in the migration keeps 0 <= reserved <= onHand.
+model StockItem {
+  id                String      @id @default(uuid())
+  kind              StockKind
+  // The catalog product's id, or a packaging code such as JAR-1KG.
+  refId             String      @db.VarChar(64)
+  name              String      @db.VarChar(120)
+  unit              StockUnit   @default(g)
+  onHand            Int         @default(0)
+  reserved          Int         @default(0)
+  lowStockThreshold Int         @default(2000)
+  status            StockStatus @default(active)
+  version           Int         @default(1)
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  reservationLines ReservationLine[]
+  movements        StockMovement[]
+
+  @@unique([kind, refId])
+  @@index([status])
+}
+
+// A hold on stock while the customer pays (15 minutes by default).
+model Reservation {
+  id        String            @id @default(uuid())
+  orderId   String            @unique @db.VarChar(64)
+  status    ReservationStatus @default(held)
+  expiresAt DateTime
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  lines ReservationLine[]
+
+  @@index([status, expiresAt])
+}
+
+model ReservationLine {
+  id            String @id @default(uuid())
+  reservationId String
+  stockItemId   String
+  quantity      Int
+
+  reservation Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  stockItem   StockItem   @relation(fields: [stockItemId], references: [id])
+
+  @@index([reservationId])
+  @@index([stockItemId])
+}
+
+// Append-only ledger: every change to on-hand or reserved stock, and why.
+model StockMovement {
+  id            String         @id @default(uuid())
+  stockItemId   String
+  onHandDelta   Int
+  reservedDelta Int
+  reason        MovementReason
+  refType       String?        @db.VarChar(32)
+  refId         String?        @db.VarChar(64)
+  actorId       String?
+  note          String?        @db.VarChar(300)
+  at            DateTime       @default(now())
+
+  stockItem StockItem @relation(fields: [stockItemId], references: [id])
+
+  @@index([stockItemId, at])
+}
+
+// Every admin write (§10).
+model AuditLog {
+  id      String   @id @default(uuid())
+  actorId String?
+  action  String   @db.VarChar(64)
+  target  String?
+  at      DateTime @default(now())
+  meta    Json?
+
+  @@index([target])
+  @@index([at])
+}
+
+enum DeliveryStatus {
+  pending
+  delivered
+  failed
+}
+
+// Transactional outbox (§8), written in the same transaction as the change it describes.
+model OutboxEvent {
+  id            String   @id @db.Char(36)
+  type          String   @db.VarChar(64)
+  version       Int
+  payload       Json
+  correlationId String?  @db.VarChar(128)
+  createdAt     DateTime @default(now()) @db.DateTime(3)
+
+  deliveries OutboxDelivery[]
+
+  @@index([createdAt])
+}
+
+// One row per consumer, so a slow or broken consumer never holds up the others.
+model OutboxDelivery {
+  eventId       String         @db.Char(36)
+  consumer      String         @db.VarChar(64)
+  status        DeliveryStatus @default(pending)
+  attempts      Int            @default(0)
+  nextAttemptAt DateTime       @default(now()) @db.DateTime(3)
+  lastError     String?        @db.VarChar(500)
+  deliveredAt   DateTime?      @db.DateTime(3)
+
+  event OutboxEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@id([eventId, consumer])
+  @@index([status, nextAttemptAt])
+}
+
+// Inbox: events this service has already handled.
+model ProcessedEvent {
+  eventId     String   @id @db.Char(36)
+  type        String   @db.VarChar(64)
+  processedAt DateTime @default(now()) @db.DateTime(3)
+}

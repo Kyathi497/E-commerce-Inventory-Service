@@ -1,0 +1,61 @@
+# inventory-service with its own database.
+#   docker network create tej-net        # once per machine, shared by all services
+#   docker compose up --build
+# Service: http://localhost:4003 (the store reaches it through the api-gateway).
+# Start it before or after catalog-service: product events wait in catalog's
+# outbox until inventory is up.
+#
+# For hot reload, run only the database here and the service on your machine:
+#   docker compose up mysql
+#   pnpm dev
+name: tej-inventory
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "3309:3306" # 3309 on the host; auth 3307, catalog 3308
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  inventory-service:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: development
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      MYSQL_USER: inventory
+      MYSQL_PASSWORD: inventory
+      MYSQL_DATABASE: inventory
+      AUTH_JWKS_URL: http://auth-service:4001/internal/.well-known/jwks.json
+      # Every new product starts with 25 kg so the store can be tried out (development only).
+      DEV_OPENING_STOCK: "25000"
+      ORDER_EVENTS_URL: http://order-service:4006/internal/events
+      EVENT_RETRY_DELAYS: "5,15,30,60"
+    ports:
+      - "4003:4003"
+    networks:
+      - default
+      - tej-net # the api-gateway and catalog-service reach it here as http://inventory-service:4003
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  tej-net:
+    external: true
+
+volumes:
+  mysql-data:
